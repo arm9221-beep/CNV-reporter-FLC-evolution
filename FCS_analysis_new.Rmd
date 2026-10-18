@@ -1,0 +1,700 @@
+---
+title: "FCS_analysis_new"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "10-12-2026"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6, dpi = 120)
+```
+
+```{r inputs}
+library(flowCore)
+library(tidyverse)
+library(dplyr)
+
+#codes written by VSC
+#"NEW" - modified by me on 10/7 to add FSC channel. This change is made in find_channelsMOD.R, with an added line in read_extract_singleMOD.R, and a minor naming change in read_extract_dirMOD.R
+#10/12 - changed to a batch analysis sorted by media + FLC (instead of FLC + temperature).
+#  find_channelsMOD.R / read_extract_singleMOD.R now also return SSC_A, SSC_H (for the singlet gate), Well and Group (condition label from the FCS file).
+#  Old versions of the files are in backup_before_batch_edit/
+#10/18 - SD renumbered by its own passage count (SD P1 = plate passage 4, see SD_PASSAGE_OFFSET), so SD P1 lines up
+#  with P1 of the other media on every plot. `Passage` = per-media passage, `PlatePassage` = passage folder / plate run.
+#10/18 - added P12 (Oct15_pass12_day28, day 28) FCS + CSV_files/pass12; picked up automatically, no layout changes.
+#  P12 has an extra well G5 ("YPGly_mix") that is outside the layout (not plotted as experimental / dropped from CSV plots).
+#10/15 - experimental wells are now shown per replicate (Rep 1/2/3 = rows D/E/F) in every plot instead of
+#  being averaged/pooled; FSC vs B2 plots split into one figure per media + FLC (controls row + one row per replicate).
+#10/14 (later) - removed the %-above-CNV-cutoff over-time plots and the control/cutoff check plot; added
+#  B2-A/FSC-A histograms per media + FLC (one row per passage, with 1-copy/2-copy controls); zoomed FSC vs B2 plots.
+#  CNV gate chunk removed; replaced the YPD mCitrine plot with median B2-A over time for every media (with controls);
+#  FSC vs B2 plots now show only the 1-copy/2-copy control medians (no cutoff).
+#10/14 - added P11 (Oct13; folder name has pass/day swapped, so folder matching now accepts either order),
+#  1-copy/2-copy controls added to the over-time and FSC vs B2 plots, zoomed the singlet-gate QC plot,
+#  and added a section plotting the SpectroFlo "SSC_S_2copy % Parent" values from CSV_files/.
+
+source("find_channelsMOD.R")
+source("read_extract_singleMOD.R")
+source("read_extract_dirMOD.R")
+
+#manual inputs ---------------------------------------------------------------
+#every folder named like "Sept20_day3_pass1" is read automatically.
+#Empty folders are skipped, so new passages/wells are picked up automatically once their
+#.fcs files are dropped into the folder - just re-knit.
+
+SINGLET_MAD_K   = 3     #SSC singlet gate: keep cells whose SSC-A/SSC-H ratio is within median +/- K*MAD (per well)
+MIN_SINGLETS    = 300   #wells with fewer singlets than this are dropped from the plots (too few cells to trust a %)
+HIST_BINWIDTH   = 0.02  #histogram bin width, in log10 units of B2-A/FSC-A (smaller = finer bins)
+GATE_LEVEL      = 0.98  #FSC-A vs B2-A gates: top/bottom edges contain this fraction of each control's cells
+GATE_END_PAD    = 0.05  #FSC-A vs B2-A gates: extra room at the left/right ends, in log10 units of FSC-A
+POINTS_PER_WELL = 1500  #singlets subsampled per well for the FSC-A vs B2-A scatter plots (keeps plots fast/readable)
+SAVE_FIGURES    = TRUE  #also save every plot as a PNG in figures/
+SD_PASSAGE_OFFSET = 3   #SD lines were started at plate passage 4: SD passage = plate passage - 3 (SD P1 = plate P4)
+```
+
+```{r readdata}
+#find all passage folders, and get date / day / passage from the folder name
+#(folder name is used instead of file name because e.g. the pass2 files are named "Sept20_passage_2")
+folders <- tibble(folder = list.dirs(".", full.names = FALSE, recursive = FALSE)) %>%
+  filter(str_detect(folder, "_day\\d+"), str_detect(folder, "_pass\\d+")) %>%
+  mutate(Date    = str_extract(folder, "^[^_]+"),
+         Day     = as.integer(str_match(folder, "_day(\\d+)")[, 2]),
+         Passage = as.integer(str_match(folder, "_pass(\\d+)")[, 2]),
+         n_fcs   = map_int(folder, ~ length(list.files(.x, pattern = "\\.fcs$", ignore.case = TRUE)))) %>%
+  arrange(Passage)
+
+folders
+
+#read every folder that has data
+combined_input <- folders %>%
+  filter(n_fcs > 0) %>%
+  mutate(data = map(folder, ~ read_extract_dirMOD(paste0(.x, "/")))) %>%
+  select(-n_fcs) %>%
+  unnest(data)
+```
+
+```{r basicprocessing}
+#Assign Media and FLC to each well from its PLATE POSITION (the condition labels in the file names don't
+#always include the FLC concentration).
+#
+#Standard plate layout (passages 4 onward):
+#  col 2 = SCGlu FLC0   col 3 = SCGlu FLC8   col 4  = SCGlu FLC16
+#  col 5 = YPGly FLC0   col 6 = YPGly FLC4   col 7  = YPGly FLC8
+#  col 9 = SD FLC0      col 10 = SD FLC4     col 11 = SD FLC8
+#  B8, C8 = YPD FLC0    D8, E8, F8 = YPD FLC16
+#
+#Passages 1 and 3 layout:
+#  col 8 = SCGlu FLC0   col 9 = SCGlu FLC8   col 10 = SCGlu FLC16
+#  col 11 = YPGly FLC0  col 12 = YPGly FLC4  H2-H6 = YPGly FLC8
+#  H7, H8 = YPD FLC0    H9, H10, H11 = YPD FLC16
+#Passage 2 layout (run on columns 1-7):
+#  col 1 = SCGlu FLC0   col 2 = SCGlu FLC8   col 3 = SCGlu FLC16
+#  col 4 = YPGly FLC0   col 5 = YPGly FLC4   col 6 = YPGly FLC8
+#  B7, C7 = YPD FLC0    D7, E7, F7 = YPD FLC16 (same 2 + 3 YPD split as P1/P3)
+
+any_row = c("B", "C", "D", "E", "F", "G", "H")
+layout_cols <- function(cols, media, flc, rows = any_row) {
+  expand_grid(Row = rows, Col = cols) %>%
+    mutate(Media = media, FLC = flc[match(Col, cols)])
+}
+
+plate_layouts <- bind_rows(
+  bind_rows(
+    layout_cols(2:4,  "SCGlu", c("FLC 0", "FLC 8", "FLC 16")),
+    layout_cols(5:7,  "YPGly", c("FLC 0", "FLC 4", "FLC 8")),
+    layout_cols(9:11, "SD",    c("FLC 0", "FLC 4", "FLC 8")),
+    layout_cols(8, "YPD", "FLC 0",  rows = c("B", "C")),
+    layout_cols(8, "YPD", "FLC 16", rows = c("D", "E", "F"))
+  ) %>% mutate(Layout = "standard"),
+  bind_rows(
+    layout_cols(1:3, "SCGlu", c("FLC 0", "FLC 8", "FLC 16")),
+    layout_cols(4:6, "YPGly", c("FLC 0", "FLC 4", "FLC 8")),
+    layout_cols(7, "YPD", "FLC 0",  rows = c("B", "C")),
+    layout_cols(7, "YPD", "FLC 16", rows = c("D", "E", "F"))
+  ) %>% mutate(Layout = "P2"),
+  bind_rows(
+    layout_cols(8:10,  "SCGlu", c("FLC 0", "FLC 8", "FLC 16"), rows = c("B", "C", "D", "E", "F")),
+    layout_cols(11:12, "YPGly", c("FLC 0", "FLC 4"),           rows = c("B", "C", "D", "E", "F")),
+    layout_cols(2:6,   "YPGly", rep("FLC 8", 5),               rows = "H"),
+    layout_cols(7:8,   "YPD",   rep("FLC 0", 2),               rows = "H"),
+    layout_cols(9:11,  "YPD",   rep("FLC 16", 3),              rows = "H")
+  ) %>% mutate(Layout = "P1_P3")
+)
+
+passage_layout <- function(passage) {
+  case_when(passage %in% c(1, 3) ~ "P1_P3",
+            passage == 2         ~ "P2",
+            TRUE                 ~ "standard")
+}
+
+combined_input <- combined_input %>%
+  mutate(Row = str_sub(Well, 1, 1),
+         Col = as.integer(str_extract(Well, "\\d+")),
+         Layout = passage_layout(Passage)) %>%
+  left_join(plate_layouts, by = c("Layout", "Row", "Col"))
+
+#sanity checks: wells not in the layout, and wells whose file label disagrees with the layout's media
+unassigned <- combined_input %>% filter(is.na(Media)) %>% distinct(Passage, Well, Group)
+if (nrow(unassigned) > 0) { message("Wells not in the plate layout (dropped):"); print(unassigned) }
+combined_input <- filter(combined_input, !is.na(Media))
+
+#Role of each well within its column:
+#  row B = 1-copy control, row C = 2-copy control, rows D-F = experimental
+#  P1/P3 YPGly FLC8 (row H, H2-H6): H2 = 1-copy control, H3 = 2-copy control, H4-H6 = experimental
+#  YPD: no controls (not CNV-gated, see CNV gate section)
+assign_role <- function(Media, Row, Col) {
+  case_when(
+    Media == "YPD"                 ~ "YPD (no controls)",
+    Row == "H" & Col == 2          ~ "1-copy control",
+    Row == "H" & Col == 3          ~ "2-copy control",
+    Row == "H"                     ~ "Experimental",
+    Row == "B"                     ~ "1-copy control",
+    Row == "C"                     ~ "2-copy control",
+    Row %in% c("D", "E", "F")      ~ "Experimental",
+    TRUE                           ~ "Extra (not in layout)")
+}
+combined_input <- combined_input %>% mutate(Role = assign_role(Media, Row, Col))
+
+#Replicate number of each experimental well. Each replicate is its own population of cells, followed across
+#passages, so the plots show replicates separately instead of averaging them:
+#  rows D / E / F = Rep 1 / 2 / 3;  P1/P3 YPGly FLC 8: H4 / H5 / H6 = Rep 1 / 2 / 3
+#  YPD FLC 0:  B / C   (P1/P3: H7 / H8)        = Rep 1 / 2
+#  YPD FLC 16: D / E / F (P1/P3: H9 / H10 / H11) = Rep 1 / 2 / 3
+assign_replicate <- function(Role, Row, Col) {
+  rep <- case_when(
+    !Role %in% c("Experimental", "YPD (no controls)") ~ NA_integer_,
+    Row == "H" & Role == "Experimental" ~ Col - 3L,
+    Row == "H" & Col %in% 7:8          ~ Col - 6L,
+    Row == "H" & Col %in% 9:11         ~ Col - 8L,
+    Row %in% c("B", "D")               ~ 1L,
+    Row %in% c("C", "E")               ~ 2L,
+    Row == "F"                         ~ 3L)
+  factor(ifelse(is.na(rep), NA, paste("Rep", rep)), levels = paste("Rep", 1:3))
+}
+combined_input <- combined_input %>% mutate(Replicate = assign_replicate(Role, Row, Col))
+
+label_media <- function(g) {
+  g <- tolower(g)
+  case_when(str_detect(g, "^sc\\+yp") ~ "SCGlu or YPD", str_detect(g, "^scglu") ~ "SCGlu",
+            str_detect(g, "^sd") ~ "SD", str_detect(g, "^ypgly") ~ "YPGly", str_detect(g, "^ypd") ~ "YPD")
+}
+mismatch <- combined_input %>% distinct(Passage, Well, Group, Media) %>%
+  mutate(label = label_media(Group)) %>%
+  filter(!(label == Media | (label == "SCGlu or YPD" & Media %in% c("SCGlu", "YPD"))))
+if (nrow(mismatch) > 0) { message("File label media does not match plate layout:"); print(mismatch) }
+
+#Passage numbering per media. The SD lines were started later (at plate passage SD_PASSAGE_OFFSET + 1), so SD is
+#numbered by its own passage count (SD P1 = plate passage 4) and lines up with P1 of the other media.
+#PlatePassage = the passage folder (plate run) the well was read in; it is what decides the plate layout.
+media_passage <- function(media, plate_passage) {
+  as.integer(ifelse(media == "SD", plate_passage - SD_PASSAGE_OFFSET, plate_passage))
+}
+combined_input <- combined_input %>%
+  rename(PlatePassage = Passage) %>%
+  mutate(Passage = media_passage(Media, PlatePassage))
+
+flc_levels <- intersect(c("FLC 0", "FLC 4", "FLC 8", "FLC 16", "FLC unknown"), unique(combined_input$FLC))
+combined_input$FLC   <- factor(combined_input$FLC, levels = flc_levels)
+combined_input$Media <- factor(combined_input$Media, levels = c("SCGlu", "YPGly", "YPD", "SD"))
+
+#check: number of wells per media/FLC in each passage
+combined_input %>%
+  distinct(Passage, Media, FLC, Well) %>%
+  count(Media, FLC, Passage) %>%
+  pivot_wider(names_from = Passage, values_from = n, names_prefix = "P", names_sort = TRUE)
+
+#passages per media (for axis labels and "no data" bands). All media share one passage axis, from P1 to the
+#highest passage any media has reached; passages a media hasn't reached yet are shown as "no data yet".
+passage_table <- combined_input %>% distinct(Media, Passage, PlatePassage, Day) %>% arrange(Media, Passage)
+all_passages  <- seq_len(max(passage_table$Passage))
+
+#check: which plate run (passage folder) each SD passage came from
+passage_table %>% filter(Media == "SD") %>% select(SD_passage = Passage, PlatePassage, Day)
+```
+
+```{r plotstyle}
+#consistent colours/shapes for FLC everywhere (colourblind-checked); shapes double-encode FLC
+flc_colors <- c("FLC 0" = "#52514e", "FLC 4" = "#1baf7a", "FLC 8" = "#2a78d6", "FLC 16" = "#eb6834",
+                "FLC unknown" = "grey70")
+flc_shapes <- c("FLC 0" = 16, "FLC 4" = 15, "FLC 8" = 17, "FLC 16" = 18, "FLC unknown" = 1)
+#1-copy / 2-copy controls: drawn as dark lines (linetype tells them apart) on the B2-A over-time plots
+ctrl_linetypes <- c("1-copy control" = "dotted", "2-copy control" = "dashed")
+#replicates (experimental wells): told apart by point shape + line type on the over-time plots
+rep_shapes    <- c("Rep 1" = 16, "Rep 2" = 17, "Rep 3" = 15)
+rep_linetypes <- c("Rep 1" = "solid", "Rep 2" = "longdash", "Rep 3" = "twodash")
+
+theme_fcs <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey95", colour = NA),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+if (SAVE_FIGURES) dir.create("figures", showWarnings = FALSE)
+save_fig <- function(p, name, w = 10, h = 6) {
+  if (SAVE_FIGURES) ggsave(file.path("figures", paste0(name, ".png")), p, width = w, height = h, dpi = 200, bg = "white")
+}
+```
+
+## SSC singlet gate
+
+Doublets have a higher SSC-A for their SSC-H than single cells, so for each well we keep cells whose SSC-A/SSC-H ratio is close to that well's median (median ± `SINGLET_MAD_K` × MAD). Saturated events (at the 4,194,304 detector maximum) are removed first.
+
+```{r singlets}
+SAT_MAX = 4194304
+
+combined_input <- combined_input %>%
+  mutate(saturated = FSC_A >= SAT_MAX | SSC_A >= SAT_MAX | SSC_H >= SAT_MAX,
+         ssc_ratio = SSC_A / SSC_H) %>%
+  group_by(file, Passage) %>%
+  mutate(singlet = !saturated & SSC_H > 0 &
+           abs(ssc_ratio - median(ssc_ratio[!saturated & SSC_H > 0])) <=
+             SINGLET_MAD_K * mad(ssc_ratio[!saturated & SSC_H > 0])) %>%
+  ungroup()
+
+singlets <- filter(combined_input, singlet)
+
+#QC: what the gate looks like for one well of each media (latest passage)
+qc_wells <- combined_input %>% filter(PlatePassage == max(PlatePassage)) %>%
+  distinct(Media, file) %>% group_by(Media) %>% slice(1) %>% pull(file)
+
+gate_data <- combined_input %>% filter(file %in% qc_wells, SSC_H > 0, SSC_A > 0) %>%
+  mutate(Gate = ifelse(singlet, "SSC singlet", "Removed"))
+#zoom to the bulk of the cells: a few extreme outliers squash everything into one corner otherwise
+#(outliers are still counted by the gate, just not shown)
+gate_xlim <- quantile(gate_data$SSC_H, c(0.005, 0.995))
+gate_ylim <- quantile(gate_data$SSC_A, c(0.005, 0.995))
+
+p_gate <- ggplot(gate_data, aes(SSC_H, SSC_A, color = Gate)) +
+  geom_point(shape = ".", alpha = 0.6) +
+  scale_color_manual(values = c("SSC singlet" = "#2a78d6", "Removed" = "grey70")) +
+  scale_x_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  coord_cartesian(xlim = gate_xlim, ylim = gate_ylim) +
+  facet_wrap(~Media) + guides(color = guide_legend(override.aes = list(shape = 16, size = 3))) +
+  labs(title = "SSC singlet gate (one well per media, latest passage)",
+       subtitle = "Axes zoomed to the 0.5-99.5th percentile of events; extreme outliers not shown",
+       x = "SSC-H", y = "SSC-A", color = NULL) +
+  theme_fcs
+p_gate
+save_fig(p_gate, "QC_singlet_gate")
+
+#QC: fraction of events kept per well
+gate_summary <- combined_input %>%
+  group_by(Passage, Media, FLC, Well, file) %>%
+  summarize(events = n(), n_singlets = sum(singlet), pct_singlets = 100 * mean(singlet), .groups = "drop")
+
+ggplot(gate_summary, aes(factor(Passage), pct_singlets, color = FLC, shape = FLC)) +
+  geom_point(position = position_jitter(width = 0.15, height = 0, seed = 1), size = 2) +
+  scale_color_manual(values = flc_colors) + scale_shape_manual(values = flc_shapes) +
+  facet_wrap(~Media, nrow = 1) + ylim(0, 100) +
+  labs(title = "% of events kept as SSC singlets, per well", x = "Passage", y = "% singlets") +
+  theme_fcs
+```
+
+## CNV gate (per-column 1-copy / 2-copy controls)
+
+Every column on the plate is one media + FLC condition, and carries its own controls:
+
+* **row B = 1-copy control**, **row C = 2-copy control**, **rows D–F = experimental wells**
+* P1/P3 YPGly FLC 8 (H2–H6): **H2 = 1-copy control**, **H3 = 2-copy control**, H4–H6 = experimental
+
+**YPD is not gated.** YPD wells have no 1-copy/2-copy controls and are not compared to anything, because CNV formation in YPD has already been well studied and any CNVs that do arise will be obvious. YPD is shown as its raw mCitrine level over time, in the histograms, and on the FSC-A vs B2-A plots.
+
+
+```{r timeplot_helpers}
+#helpers for the over-time plots (B2-A over time and the SpectroFlo CSV section)
+#passages with no data for a media (e.g. SD passages not reached yet)
+missing_for <- function(media, have = filter(passage_table, Media == media)$Passage) setdiff(all_passages, have)
+add_missing_band <- function(p, missing) {
+  if (length(missing) == 0) return(p)
+  p + annotate("rect", xmin = missing - 0.4, xmax = missing + 0.4,
+               ymin = -Inf, ymax = Inf, fill = "grey93") +
+    labs(caption = paste0("Grey band = no data (yet) for ", paste0("P", missing, collapse = ", ")))
+}
+#x-axis labels per media, e.g. "P1\nday 3" (day = experiment day the passage was read; SD has its own days)
+passage_axis <- function(media) {
+  d <- filter(passage_table, Media == media)
+  day <- d$Day[match(all_passages, d$Passage)]
+  scale_x_continuous(breaks = all_passages,
+                     labels = ifelse(is.na(day), paste0("P", all_passages), paste0("P", all_passages, "\nday ", day)),
+                     limits = range(all_passages) + c(-0.5, 0.5))
+}
+#panel labels for the histograms / scatter plots, e.g. "P1 (day 3)", ordered by passage
+passage_lab_levels <- passage_table %>% distinct(Passage, Day) %>% arrange(Passage, Day) %>%
+  with(paste0("P", Passage, " (day ", Day, ")"))
+passage_lab <- function(passage, day) {
+  factor(paste0("P", passage, " (day ", day, ")"), levels = unique(passage_lab_levels))
+}
+sd_note <- paste0("SD numbered by its own passages (SD P1 = plate passage ", SD_PASSAGE_OFFSET + 1, "); days = experiment day")
+
+#wells: one row per well with Passage, Media, FLC, Role, Replicate and the plotted value in `value`
+#each replicate is drawn as its own line (colour = FLC, shape + line type = replicate);
+#controls are drawn as grey lines (one per FLC panel)
+plot_time_with_controls <- function(wells, media, ylab, title, subtitle = NULL, missing = missing_for(media)) {
+  wells <- filter(wells, Media == media)
+  exp_w <- wells %>% filter(Role %in% c("Experimental", "YPD (no controls)")) %>% mutate(Key = as.character(Replicate))
+  ctrl_w <- wells %>% filter(Role %in% names(ctrl_linetypes)) %>%
+    group_by(Passage, FLC, Role) %>% summarize(value = mean(value), .groups = "drop") %>% mutate(Key = Role)
+  #one shared legend for controls + replicates (line type and point shape)
+  keys <- c(names(ctrl_linetypes), names(rep_linetypes))
+  keys <- keys[keys %in% c(exp_w$Key, ctrl_w$Key)]
+  key_lt <- c(ctrl_linetypes, rep_linetypes)[keys]
+  key_sh <- c("1-copy control" = 1, "2-copy control" = 1, rep_shapes)[keys]
+  key_col <- ifelse(keys %in% names(ctrl_linetypes), "grey35", "grey15")
+  dodge <- position_dodge(width = 0.35)
+
+  p <- ggplot(exp_w, aes(Passage, value, color = FLC, group = Key))
+  add_missing_band(p, missing) +
+    geom_line(data = ctrl_w, aes(Passage, value, linetype = Key, group = Key),
+              inherit.aes = FALSE, color = "grey35", linewidth = 0.6) +
+    geom_point(data = ctrl_w, aes(Passage, value, shape = Key), inherit.aes = FALSE,
+               color = "grey35", size = 1.6) +
+    geom_line(aes(linetype = Key), linewidth = 0.8, position = dodge) +
+    geom_point(aes(shape = Key), size = 2.6, position = dodge) +
+    passage_axis(media) +
+    scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.08))) +
+    scale_color_manual(values = flc_colors, drop = TRUE) +
+    scale_linetype_manual(values = key_lt, breaks = keys) +
+    scale_shape_manual(values = key_sh, breaks = keys) +
+    facet_wrap(~FLC, ncol = 1) +
+    guides(color = "none",
+           linetype = guide_legend(override.aes = list(colour = key_col, linewidth = 0.8), nrow = 1),
+           shape = guide_legend(override.aes = list(colour = key_col), nrow = 1)) +
+    labs(title = title, subtitle = subtitle, x = NULL, y = ylab, linetype = NULL, shape = NULL) +
+    theme_fcs +
+    theme(legend.key.width = unit(3.2, "lines"))
+}
+```
+
+## mCitrine (B2-A) over time, by media
+
+Median B2-A (raw mCitrine, not normalized to cell size) of each well, per passage. One panel per FLC condition. Each experimental replicate is its own line (**Rep 1 / 2 / 3** = rows D / E / F; point shape and line type tell them apart), since each replicate is a separate population. Points are nudged sideways slightly so replicates don't hide each other. Grey lines = that column's **1-copy control (dotted)** and **2-copy control (dashed)**. YPD has no controls, so all its wells are shown on their own. Wells with fewer than `MIN_SINGLETS` singlets are left out.
+
+```{r b2_over_time, fig.height=8}
+#per-well summary of the SSC singlets
+per_well <- singlets %>%
+  group_by(folder, Date, Day, Passage, PlatePassage, Media, FLC, Role, Replicate, Group, Well, file) %>%
+  summarize(n_singlets = n(),
+            median_B2_A = median(B2_A),
+            median_FSC_A = median(FSC_A),
+            median_B2_over_FSC = median(B2_A / FSC_A),
+            .groups = "drop")
+write.csv(per_well, "per_well_mCitrine.csv", row.names = FALSE)
+
+low_wells <- filter(per_well, n_singlets < MIN_SINGLETS)
+if (nrow(low_wells) > 0) {
+  message(nrow(low_wells), " well(s) with < ", MIN_SINGLETS, " singlets dropped from the plots:")
+  print(select(low_wells, Passage, Media, FLC, Role, Well, n_singlets))
+}
+
+b2_wells <- per_well %>%
+  filter(n_singlets >= MIN_SINGLETS, Role != "Extra (not in layout)") %>%
+  mutate(value = median_B2_A)
+
+for (m in levels(droplevels(b2_wells$Media))) {
+  note <- c(if (m == "SD") sd_note,
+            if (m == "YPD") "No copy-number controls in YPD")
+  p <- plot_time_with_controls(b2_wells, m, ylab = "Median B2-A (mCitrine) per well",
+                               title = paste0(m, ": mCitrine (B2-A) over time"),
+                               subtitle = if (length(note)) paste(note, collapse = "; ") else NULL) +
+    scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.08)),
+                       labels = scales::label_number(scale_cut = scales::cut_short_scale()))
+  print(p)
+  save_fig(p, paste0("B2A_over_time_", m), w = 9, h = 8)
+}
+```
+
+## B2-A/FSC-A histograms over time, by media and FLC
+
+One graph per media + FLC condition, one row per passage (earliest at the top) and **one column per replicate** (each replicate is its own population), so the shift from 1-copy towards 2-copy can be followed down the page for each replicate. The y-axis is the % of cells in each bin (so wells with different cell counts are comparable).
+
+* **Grey bars** = that replicate's experimental well (Rep 1 / 2 / 3 = rows D / E / F, or H4 / H5 / H6 for P1/P3 YPGly FLC 8)
+* **Blue outline** = that column's 1-copy control (the same controls are repeated in each replicate column), **purple outline** = 2-copy control; dashed vertical lines = their medians
+* YPD has no controls, so only its wells are shown
+
+The x-axis is zoomed to the 0.5–99.5th percentile of cells for that condition (outliers not shown). Wells with fewer than `MIN_SINGLETS` singlets are left out.
+
+```{r histograms, fig.width=12, fig.height=11}
+hist_colors <- c("Experimental well" = "grey60", "1-copy control" = "#2a78d6", "2-copy control" = "#7b3fb5")
+
+hist_data <- singlets %>%
+  filter(B2_A > 0, FSC_A > 0, Role %in% c("Experimental", "YPD (no controls)", names(ctrl_linetypes))) %>%
+  anti_join(low_wells, by = c("file", "Passage")) %>%
+  transmute(Passage, Day, Media, FLC, Replicate,
+            ratio = B2_A / FSC_A,
+            Sample = factor(ifelse(Role %in% names(ctrl_linetypes), Role, "Experimental well"),
+                            levels = names(hist_colors)),
+            PassageLab = passage_lab(Passage, Day))
+
+
+plot_hist <- function(media, flc) {
+  d <- filter(hist_data, Media == media, FLC == flc) %>% mutate(PassageLab = droplevels(PassageLab))
+  exp_d  <- filter(d, Sample == "Experimental well") %>% mutate(Replicate = droplevels(Replicate))
+  #controls are repeated in every replicate column, as the reference for that replicate
+  reps   <- levels(exp_d$Replicate)
+  ctrl_d <- filter(d, Sample != "Experimental well") %>% select(-Replicate) %>%
+    expand_grid(Replicate = factor(reps, levels = reps))
+  ctrl_med <- ctrl_d %>% group_by(PassageLab, Replicate, Sample) %>% summarize(med = median(ratio), .groups = "drop")
+
+  #y = % of that sample's cells in each bin (density x bin width, computed per sample and passage)
+  ggplot(exp_d, aes(ratio)) +
+    geom_histogram(data = exp_d, aes(y = after_stat(density * width * 100), fill = Sample), binwidth = HIST_BINWIDTH, boundary = 0) +
+    geom_freqpoly(data = ctrl_d, aes(y = after_stat(density * width * 100), color = Sample), binwidth = HIST_BINWIDTH,
+                  boundary = 0, linewidth = 0.7) +
+    geom_vline(data = ctrl_med, aes(xintercept = med, color = Sample), linetype = 2, linewidth = 0.4,
+               show.legend = FALSE) +
+    scale_x_log10() +
+    coord_cartesian(xlim = quantile(d$ratio, c(0.005, 0.995))) +
+    scale_fill_manual(values = hist_colors, drop = TRUE) +
+    scale_color_manual(values = hist_colors, drop = TRUE) +
+    facet_grid(PassageLab ~ Replicate) +
+    labs(title = paste0(media, ", ", flc, ": B2-A/FSC-A per passage, by replicate"),
+         subtitle = if (media == "YPD") "No copy-number controls in YPD" else if (media == "SD") sd_note else NULL,
+         x = "B2-A / FSC-A (mCitrine normalized to cell size, log scale)", y = "% of cells per bin",
+         fill = NULL, color = NULL) +
+    theme_fcs +
+    theme(strip.text.y = element_text(angle = 0), panel.spacing.y = unit(2, "pt"))
+}
+
+for (m in levels(droplevels(hist_data$Media))) {
+  for (f in levels(droplevels(filter(hist_data, Media == m)$FLC))) {
+    p <- plot_hist(m, f)
+    print(p)
+    save_fig(p, paste0("Hist_B2_FSC_", m, "_", str_replace(f, " ", "")), w = 12, h = 11)
+  }
+}
+```
+
+## FSC-A vs B2-A, by media and FLC
+
+One figure per media + FLC condition; columns = passages. The top row is the **controls** row with that column's 1-copy (light blue) and 2-copy (light purple) control cells; below it is **one row per replicate** (Rep 1 / 2 / 3 = rows D / E / F), each its own experimental well. `POINTS_PER_WELL` singlets are plotted per well; axes are zoomed to the main cell population (low-signal debris and the top 0.1% of events not shown); blank panels = that condition wasn't on the plate that passage.
+
+**Gates** are rectangular bands fitted to the controls in the controls row (on the log FSC-A / log B2-A scale). Both gates in a column follow the slope of the control cells, so they are parallel. The top and bottom edges of the **blue (1-copy)** and **purple (2-copy)** gates contain `GATE_LEVEL` (98%) of that control's cells, and the left and right ends are loose FSC-A limits. Where the two controls overlap, the boundary between the gates is set halfway, so **the gates never overlap** and each cell is either 1-copy, 2-copy, or in neither gate. The same gates are then drawn on each replicate row below, and the numbers there are the % of that replicate's singlets (all of them, not just the plotted subsample) inside each gate. YPD has no controls, so no gates. Gate coordinates are saved to `gates_per_column.csv` and per-well gate percentages to `per_well_gates.csv`.
+
+```{r fsc_vs_b2, results="asis"}
+set.seed(1)
+gate_colors <- c("1-copy gate" = "#2a78d6", "2-copy gate" = "#7b3fb5")
+
+#Rectangular gates, fitted per column (= passage + media + FLC) on the log FSC-A / log B2-A scale:
+#  * the gate is a band that follows the slope of the control cells; both gates in a column share one slope
+#    (regression of log B2-A on log FSC-A across both controls), so they are parallel
+#  * top / bottom edges = the offsets (log B2-A - slope * log FSC-A) that contain GATE_LEVEL of that control's cells
+#  * left / right ends = vertical FSC-A limits at the control's 0.5th / 99.5th percentile, padded by GATE_END_PAD
+#  * if the 1-copy top edge would sit above the 2-copy bottom edge, both are moved to the midpoint between them,
+#    so the gates never overlap
+#Control debris is excluded first (cells far outside a robust fit of each control's cloud).
+fit_column_gates <- function(cells) {
+  if (n_distinct(cells$Role) < 2) return(tibble())   #need both controls
+  per_ctrl <- lapply(split(cells, cells$Role), function(x) {
+    m <- cbind(x$u, x$v)
+    fit <- MASS::cov.trob(if (nrow(m) > 5000) m[sample(nrow(m), 5000), ] else m)
+    core <- mahalanobis(m, fit$center, fit$cov) <= qchisq(0.999, df = 2)
+    list(u = x$u[core], v = x$v[core])
+  })
+  #shared slope = regression of log B2-A on log FSC-A with a separate intercept per control:
+  #the slope that makes the bands as narrow as possible top-to-bottom
+  core_cells <- imap_dfr(per_ctrl, ~ tibble(Role = .y, u = .x$u, v = .x$v))
+  s <- unname(coef(lm(v ~ u + Role, data = core_cells))["u"])
+  g <- tibble(Role  = names(per_ctrl),
+              slope = s,
+              u_min = map_dbl(per_ctrl, ~ quantile(.x$u, 0.005, names = FALSE)) - GATE_END_PAD,
+              u_max = map_dbl(per_ctrl, ~ quantile(.x$u, 0.995, names = FALSE)) + GATE_END_PAD,
+              w_min = map_dbl(per_ctrl, ~ quantile(.x$v - s * .x$u, (1 - GATE_LEVEL) / 2, names = FALSE)),
+              w_max = map_dbl(per_ctrl, ~ quantile(.x$v - s * .x$u, (1 + GATE_LEVEL) / 2, names = FALSE)))
+  i1 <- g$Role == "1-copy control"; i2 <- g$Role == "2-copy control"
+  if (g$w_max[i1] > g$w_min[i2]) {
+    mid <- (g$w_max[i1] + g$w_min[i2]) / 2
+    g$w_max[i1] <- mid; g$w_min[i2] <- mid
+  }
+  g
+}
+
+gates <- singlets %>%
+  filter(FSC_A > 0, B2_A > 0, Role %in% names(ctrl_linetypes)) %>%
+  transmute(Passage, Day, Media, FLC, Role, u = log10(FSC_A), v = log10(B2_A)) %>%
+  group_by(Passage, Day, Media, FLC) %>%
+  group_modify(~ fit_column_gates(.x)) %>%
+  ungroup() %>%
+  mutate(Gate = sub(" control", " gate", Role), PassageLab = passage_lab(Passage, Day))
+write.csv(mutate(gates, across(c(u_min, u_max), ~ 10^.x, .names = "FSC_A_{.col}")) %>%
+            select(Passage, Media, FLC, Gate, slope, w_min, w_max, FSC_A_u_min, FSC_A_u_max),
+          "gates_per_column.csv", row.names = FALSE)
+
+#gate outlines for plotting (the 4 corners, closed)
+gate_outlines <- gates %>%
+  mutate(path = pmap(list(slope, u_min, u_max, w_min, w_max), function(s, u1, u2, w1, w2) {
+    u <- c(u1, u2, u2, u1, u1)
+    w <- c(w1, w1, w2, w2, w1)
+    tibble(FSC_A = 10^u, B2_A = 10^(w + s * u))
+  })) %>%
+  select(Passage, Media, FLC, Gate, PassageLab, path) %>%
+  unnest(path)
+
+#% of experimental singlets inside each gate, per well
+in_gate <- function(fsc, b2, s, u1, u2, w1, w2) {
+  u <- log10(fsc); w <- log10(b2) - s * u
+  u >= u1 & u <= u2 & w >= w1 & w <= w2
+}
+per_well_gates <- singlets %>%
+  filter(FSC_A > 0, B2_A > 0, Role == "Experimental") %>%
+  anti_join(low_wells, by = c("file", "Passage")) %>%
+  inner_join(select(gates, Passage, Media, FLC, Gate, slope, u_min, u_max, w_min, w_max),
+             by = c("Passage", "Media", "FLC"), relationship = "many-to-many") %>%
+  group_by(Passage, Day, Media, FLC, Replicate, Well, Gate) %>%
+  summarize(n_singlets = n(),
+            pct_in_gate = 100 * mean(in_gate(FSC_A, B2_A, first(slope), first(u_min), first(u_max),
+                                             first(w_min), first(w_max))),
+            .groups = "drop")
+write.csv(per_well_gates, "per_well_gates.csv", row.names = FALSE)
+
+#% per replicate (= per well) for the panel labels
+gate_labels <- per_well_gates %>%
+  mutate(PassageLab = passage_lab(Passage, Day), lab = paste0(round(pct_in_gate, 1), "%"))
+
+#cells to plot: POINTS_PER_WELL singlets per well, for the experimental wells and for the control wells
+scatter_data <- singlets %>%
+  filter(FSC_A > 0, B2_A > 0, Role %in% c("Experimental", "YPD (no controls)", names(ctrl_linetypes))) %>%
+  group_by(file, Passage) %>%
+  slice_sample(n = POINTS_PER_WELL) %>%
+  ungroup() %>%
+  mutate(PassageLab = passage_lab(Passage, Day),
+         Cells = case_when(Role == "1-copy control" ~ "1-copy control cells",
+                           Role == "2-copy control" ~ "2-copy control cells",
+                           TRUE                     ~ "Experimental cells"),
+         RowLab = ifelse(Role %in% names(ctrl_linetypes), "controls", as.character(Replicate)))
+
+#colours: control cells are lighter tints of their gate colour
+scatter_colors <- c("Experimental cells" = "grey45", "1-copy control cells" = "#9cc0ec", "2-copy control cells" = "#c9aee6",
+                    gate_colors)
+
+#rows: the controls (where the gates are drawn from) on top, then one row per replicate
+plot_fsc_b2 <- function(media, flc) {
+  d <- filter(scatter_data, Media == media, FLC == flc)
+  row_levels <- intersect(c("controls", names(rep_shapes)), unique(d$RowLab))
+  d <- d %>%
+    mutate(RowLab = factor(RowLab, levels = row_levels),
+           Cells = factor(Cells, levels = names(scatter_colors))) %>%
+    arrange(Cells)   #draw 2-copy control cells on top of 1-copy
+  #zoom to the bulk of the cells (same idea as the singlet-gate QC plot)
+  #axes: lower end = median - 4 MAD of the cells (on the log scale), so low-signal debris is left out;
+  #upper end = 99.9th percentile + a small margin (the detector maxes out at ~4.2M)
+  zoom <- function(v) { lv <- log10(v); c(10^(median(lv) - 4 * mad(lv)), 1.15 * quantile(v, 0.999, names = FALSE)) }
+
+  #the same gate is drawn on the controls row and on every replicate row below it
+  panels <- distinct(d, PassageLab)
+  outl <- gate_outlines %>% filter(Media == media, FLC == flc) %>% semi_join(panels, by = "PassageLab") %>%
+    expand_grid(RowLab = factor(row_levels, levels = row_levels))
+  #% inside each gate: replicate rows only
+  labs_d <- gate_labels %>% filter(Media == media, FLC == flc) %>% semi_join(panels, by = "PassageLab") %>%
+    mutate(RowLab = factor(as.character(Replicate), levels = row_levels))
+
+  #legend: points for the cell types, lines for the gates (only for what is actually on this plot)
+  present <- c(as.character(unique(d$Cells)), unique(as.character(outl$Gate)))
+  col_vals <- scatter_colors[names(scatter_colors) %in% present]
+  is_gate <- names(col_vals) %in% names(gate_colors)
+  key_aes <- list(shape = ifelse(is_gate, NA, 16), size = 3, alpha = 1,
+                  linetype = ifelse(is_gate, 1, 0), linewidth = 1)
+
+  ggplot(d, aes(FSC_A, B2_A, color = Cells)) +
+    geom_point(shape = 16, size = 0.4, alpha = 0.4) +
+    geom_path(data = outl, aes(color = Gate, group = Gate), linewidth = 0.7) +
+    #1-copy % bottom-right, 2-copy % top-left (0 on a log axis = -Inf = panel edge; a literal -Inf would be dropped)
+    geom_text(data = filter(labs_d, Gate == "1-copy gate"), aes(x = Inf, y = 0, label = lab, color = Gate),
+              hjust = 1.1, vjust = -0.6, size = 3, show.legend = FALSE) +
+    geom_text(data = filter(labs_d, Gate == "2-copy gate"), aes(x = 0, y = Inf, label = lab, color = Gate),
+              hjust = -0.1, vjust = 1.4, size = 3, show.legend = FALSE) +
+    scale_x_log10(breaks = scales::breaks_log(n = 4), labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    coord_cartesian(xlim = zoom(d$FSC_A), ylim = zoom(d$B2_A)) +
+    scale_color_manual(values = col_vals, breaks = names(col_vals)) +
+    facet_grid(RowLab ~ PassageLab, drop = TRUE) +
+    guides(color = guide_legend(override.aes = key_aes, nrow = 1)) +
+    labs(title = paste0(media, ", ", flc, ": FSC-A vs B2-A (mCitrine), SSC singlets, by replicate",
+                        if (media == "YPD") " (no controls, no gates)" else ""),
+         subtitle = if (media != "YPD") paste("Gates are fitted to the control cells (\"controls\" row) and applied to each replicate of the same",
+                                              "FLC + passage; numbers = % of that replicate's cells inside each gate") else NULL,
+         x = "FSC-A (cell size)", y = "B2-A (mCitrine)", color = NULL) +
+    theme_fcs +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), strip.text.y = element_text(angle = 0))
+}
+
+for (m in levels(droplevels(scatter_data$Media))) {
+  for (f in levels(droplevels(filter(scatter_data, Media == m)$FLC))) {
+    p <- plot_fsc_b2(m, f)
+    n_rows <- n_distinct(filter(scatter_data, Media == m, FLC == f)$RowLab)
+    fig_h <- 2.2 + 1.9 * n_rows
+    name <- paste0("FSC_vs_B2_", m, "_", str_replace(f, " ", ""))
+    #knitr can't change fig.height inside a loop, so each plot is saved at its own height and shown from the PNG
+    save_fig(p, name, w = 15, h = fig_h)
+    if (SAVE_FIGURES) cat(sprintf("\n\n![](figures/%s.png)\n\n", name)) else print(p)
+  }
+}
+```
+
+## SpectroFlo 2-copy gate (`SSC_S_2copy % Parent`) over time, from CSV_files
+
+These values come straight from the SpectroFlo statistics exports in `CSV_files/passN/` (the instrument-side `SSC_S_2copy` gate, as % of its parent), not from the R gating above. Each well is matched to its media / FLC by plate position (same layouts as above), and the plate passage is taken from the `passN` folder name. SD is renumbered by its own passage count like everywhere else (SD P1 = plate passage 4; the SD CSV file names already use this numbering). One graph per media with all its FLC conditions: colour = FLC, and each experimental replicate is its own line (**Rep 1 / 2 / 3** = rows D / E / F; point shape and line type tell them apart). Points are nudged sideways slightly so the lines don't hide each other. YPD has no controls; all YPD wells are shown.
+
+```{r csv_2copy, fig.height=5.5}
+csv_files <- list.files("CSV_files", pattern = "\\.csv$", recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
+
+csv_wells <- tibble(path = csv_files) %>%
+  mutate(Passage = as.integer(str_match(path, "pass(\\d+)/")[, 2]),
+         data = map(path, ~ read.csv(.x, check.names = FALSE, fileEncoding = "UTF-8-BOM") %>%
+                      select(id = 1, value = all_of("SSC_S_2copy % Parent")))) %>%
+  unnest(data) %>%
+  filter(!is.na(value)) %>%
+  mutate(Well = str_match(id, "-([A-H]\\d{1,2}) Well_")[, 2],
+         Row = str_sub(Well, 1, 1),
+         Col = as.integer(str_extract(Well, "\\d+")),
+         Layout = passage_layout(Passage)) %>%
+  left_join(plate_layouts, by = c("Layout", "Row", "Col")) %>%
+  mutate(Role = assign_role(Media, Row, Col),
+         Replicate = assign_replicate(Role, Row, Col),
+         PlatePassage = Passage,
+         Passage = media_passage(Media, PlatePassage))
+
+csv_dropped <- filter(csv_wells, is.na(Media) | Role == "Extra (not in layout)")
+if (nrow(csv_dropped) > 0) {
+  message("CSV wells not in the plate layout (not plotted):")
+  print(distinct(csv_dropped, PlatePassage, Well, id))
+}
+csv_wells <- csv_wells %>%
+  filter(!is.na(Media), Role != "Extra (not in layout)") %>%
+  distinct(PlatePassage, Well, .keep_all = TRUE) %>%
+  mutate(FLC = factor(FLC, levels = flc_levels),
+         Media = factor(Media, levels = levels(combined_input$Media)))
+write.csv(select(csv_wells, Passage, PlatePassage, Media, FLC, Role, Replicate, Well, pct_SSC_S_2copy = value, id),
+          "CSV_SSC_S_2copy_per_well.csv", row.names = FALSE)
+
+#one graph per media, all FLC conditions together (experimental wells only; no controls), one line per replicate
+csv_exp <- filter(csv_wells, Role %in% c("Experimental", "YPD (no controls)"))
+
+for (m in levels(droplevels(csv_exp$Media))) {
+  wells <- filter(csv_exp, Media == m)
+  dodge <- position_dodge(width = 0.5)
+  p <- ggplot(wells, aes(Passage, value, color = FLC, shape = Replicate, linetype = Replicate,
+                         group = interaction(FLC, Replicate)))
+  p <- add_missing_band(p, setdiff(all_passages, wells$Passage)) +
+    geom_line(linewidth = 0.7, position = dodge) +
+    geom_point(size = 2.4, position = dodge) +
+    passage_axis(m) +
+    scale_y_continuous(limits = c(0, 100), expand = expansion(mult = c(0, 0.02))) +
+    scale_color_manual(values = flc_colors, drop = TRUE) +
+    scale_shape_manual(values = rep_shapes, drop = TRUE) +
+    scale_linetype_manual(values = rep_linetypes, drop = TRUE) +
+    guides(color = guide_legend(order = 1, override.aes = list(linetype = 1, shape = 16)),
+           shape = guide_legend(order = 2), linetype = guide_legend(order = 2)) +
+    labs(title = paste0(m, ": SpectroFlo SSC_S_2copy gate over time, by replicate"),
+         subtitle = if (m == "SD") sd_note else NULL,
+         x = NULL, y = "SSC_S_2copy % Parent", color = NULL, shape = NULL, linetype = NULL) +
+    theme_fcs +
+    theme(legend.key.width = unit(3.2, "lines"))
+  print(p)
+  save_fig(p, paste0("CSV_SSC_S_2copy_over_time_", m), w = 10, h = 6)
+}
+```
