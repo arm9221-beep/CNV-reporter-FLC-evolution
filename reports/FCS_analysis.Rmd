@@ -22,6 +22,8 @@ library(dplyr)
 #10/12 - changed to a batch analysis sorted by media + FLC (instead of FLC + temperature).
 #  find_channelsMOD.R / read_extract_singleMOD.R now also return SSC_A, SSC_H (for the singlet gate), Well and Group (condition label from the FCS file).
 #  Old versions of the files are in backup_before_batch_edit/
+#10/18 (later) - added SD-only runs: folders named like "Oct18_SDpass10day31" (and CSV_files/SDpass10) hold only the
+#  SD wells, numbered by SD's own passage, on columns 6/7/8 = SD FLC 0/4/8 (layout "SD_only").
 #10/18 - SD renumbered by its own passage count (SD P1 = plate passage 4, see SD_PASSAGE_OFFSET), so SD P1 lines up
 #  with P1 of the other media on every plot. `Passage` = per-media passage, `PlatePassage` = passage folder / plate run.
 #10/18 - added P12 (Oct15_pass12_day28, day 28) FCS + CSV_files/pass12; picked up automatically, no layout changes.
@@ -42,6 +44,8 @@ source("read_extract_dirMOD.R")
 
 #manual inputs ---------------------------------------------------------------
 #every folder named like "Sept20_day3_pass1" is read automatically.
+#SD-only runs (after the other media finished) go in folders named like "Oct18_SDpass10day31", where the number
+#after "SDpass" is SD's own passage; their CSV exports go in CSV_files/SDpassN/.
 #Empty folders are skipped, so new passages/wells are picked up automatically once their
 #.fcs files are dropped into the folder - just re-knit.
 
@@ -59,10 +63,13 @@ SD_PASSAGE_OFFSET = 3   #SD lines were started at plate passage 4: SD passage = 
 #find all passage folders, and get date / day / passage from the folder name
 #(folder name is used instead of file name because e.g. the pass2 files are named "Sept20_passage_2")
 folders <- tibble(folder = list.dirs(".", full.names = FALSE, recursive = FALSE)) %>%
-  filter(str_detect(folder, "_day\\d+"), str_detect(folder, "_pass\\d+")) %>%
+  filter(str_detect(folder, "day\\d+"), str_detect(folder, "pass\\d+")) %>%
   mutate(Date    = str_extract(folder, "^[^_]+"),
-         Day     = as.integer(str_match(folder, "_day(\\d+)")[, 2]),
-         Passage = as.integer(str_match(folder, "_pass(\\d+)")[, 2]),
+         Day     = as.integer(str_match(folder, "day(\\d+)")[, 2]),
+         SD_only = str_detect(folder, "SDpass\\d+"),
+         #Passage = plate passage. SD-only folders are numbered by SD passage, so they are converted to the
+         #equivalent plate passage (SD passage + SD_PASSAGE_OFFSET) here and back to SD passage further down
+         Passage = as.integer(str_match(folder, "pass(\\d+)")[, 2]) + ifelse(SD_only, SD_PASSAGE_OFFSET, 0L),
          n_fcs   = map_int(folder, ~ length(list.files(.x, pattern = "\\.fcs$", ignore.case = TRUE)))) %>%
   arrange(Passage)
 
@@ -94,6 +101,8 @@ combined_input <- folders %>%
 #  col 1 = SCGlu FLC0   col 2 = SCGlu FLC8   col 3 = SCGlu FLC16
 #  col 4 = YPGly FLC0   col 5 = YPGly FLC4   col 6 = YPGly FLC8
 #  B7, C7 = YPD FLC0    D7, E7, F7 = YPD FLC16 (same 2 + 3 YPD split as P1/P3)
+#SD-only runs (SD passage 10 onward, folders named "..._SDpassN..."): SD moved from columns 9-11 to 6-8, same order:
+#  col 6 = SD FLC0      col 7 = SD FLC4      col 8 = SD FLC8
 
 any_row = c("B", "C", "D", "E", "F", "G", "H")
 layout_cols <- function(cols, media, flc, rows = any_row) {
@@ -121,11 +130,13 @@ plate_layouts <- bind_rows(
     layout_cols(2:6,   "YPGly", rep("FLC 8", 5),               rows = "H"),
     layout_cols(7:8,   "YPD",   rep("FLC 0", 2),               rows = "H"),
     layout_cols(9:11,  "YPD",   rep("FLC 16", 3),              rows = "H")
-  ) %>% mutate(Layout = "P1_P3")
+  ) %>% mutate(Layout = "P1_P3"),
+  layout_cols(6:8, "SD", c("FLC 0", "FLC 4", "FLC 8")) %>% mutate(Layout = "SD_only")
 )
 
-passage_layout <- function(passage) {
-  case_when(passage %in% c(1, 3) ~ "P1_P3",
+passage_layout <- function(passage, sd_only = FALSE) {
+  case_when(sd_only              ~ "SD_only",
+            passage %in% c(1, 3) ~ "P1_P3",
             passage == 2         ~ "P2",
             TRUE                 ~ "standard")
 }
@@ -133,7 +144,7 @@ passage_layout <- function(passage) {
 combined_input <- combined_input %>%
   mutate(Row = str_sub(Well, 1, 1),
          Col = as.integer(str_extract(Well, "\\d+")),
-         Layout = passage_layout(Passage)) %>%
+         Layout = passage_layout(Passage, SD_only)) %>%
   left_join(plate_layouts, by = c("Layout", "Row", "Col"))
 
 #sanity checks: wells not in the layout, and wells whose file label disagrees with the layout's media
@@ -188,7 +199,7 @@ if (nrow(mismatch) > 0) { message("File label media does not match plate layout:
 
 #Passage numbering per media. The SD lines were started later (at plate passage SD_PASSAGE_OFFSET + 1), so SD is
 #numbered by its own passage count (SD P1 = plate passage 4) and lines up with P1 of the other media.
-#PlatePassage = the passage folder (plate run) the well was read in; it is what decides the plate layout.
+#PlatePassage = the passage folder (plate run) the well was read in (for SD-only runs: SD passage + SD_PASSAGE_OFFSET).
 media_passage <- function(media, plate_passage) {
   as.integer(ifelse(media == "SD", plate_passage - SD_PASSAGE_OFFSET, plate_passage))
 }
@@ -257,9 +268,9 @@ combined_input <- combined_input %>%
 
 singlets <- filter(combined_input, singlet)
 
-#QC: what the gate looks like for one well of each media (latest passage)
-qc_wells <- combined_input %>% filter(PlatePassage == max(PlatePassage)) %>%
-  distinct(Media, file) %>% group_by(Media) %>% slice(1) %>% pull(file)
+#QC: what the gate looks like for one well of each media (latest passage of that media)
+qc_wells <- combined_input %>% group_by(Media) %>% filter(PlatePassage == max(PlatePassage)) %>%
+  distinct(Media, file) %>% slice(1) %>% pull(file)
 
 gate_data <- combined_input %>% filter(file %in% qc_wells, SSC_H > 0, SSC_A > 0) %>%
   mutate(Gate = ifelse(singlet, "SSC singlet", "Removed"))
@@ -275,7 +286,7 @@ p_gate <- ggplot(gate_data, aes(SSC_H, SSC_A, color = Gate)) +
   scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
   coord_cartesian(xlim = gate_xlim, ylim = gate_ylim) +
   facet_wrap(~Media) + guides(color = guide_legend(override.aes = list(shape = 16, size = 3))) +
-  labs(title = "SSC singlet gate (one well per media, latest passage)",
+  labs(title = "SSC singlet gate (one well per media, latest passage of each media)",
        subtitle = "Axes zoomed to the 0.5-99.5th percentile of events; extreme outliers not shown",
        x = "SSC-H", y = "SSC-A", color = NULL) +
   theme_fcs
@@ -637,13 +648,14 @@ for (m in levels(droplevels(scatter_data$Media))) {
 
 ## SpectroFlo 2-copy gate (`SSC_S_2copy % Parent`) over time, from CSV_files
 
-These values come straight from the SpectroFlo statistics exports in `CSV_files/passN/` (the instrument-side `SSC_S_2copy` gate, as % of its parent), not from the R gating above. Each well is matched to its media / FLC by plate position (same layouts as above), and the plate passage is taken from the `passN` folder name. SD is renumbered by its own passage count like everywhere else (SD P1 = plate passage 4; the SD CSV file names already use this numbering). One graph per media with all its FLC conditions: colour = FLC, and each experimental replicate is its own line (**Rep 1 / 2 / 3** = rows D / E / F; point shape and line type tell them apart). Points are nudged sideways slightly so the lines don't hide each other. YPD has no controls; all YPD wells are shown.
+These values come straight from the SpectroFlo statistics exports in `CSV_files/passN/` (the instrument-side `SSC_S_2copy` gate, as % of its parent), not from the R gating above. Each well is matched to its media / FLC by plate position (same layouts as above), and the plate passage is taken from the `passN` folder name (`SDpassN` folders hold SD-only runs, numbered by SD passage). SD is renumbered by its own passage count like everywhere else (SD P1 = plate passage 4; the SD CSV file names already use this numbering). One graph per media with all its FLC conditions: colour = FLC, and each experimental replicate is its own line (**Rep 1 / 2 / 3** = rows D / E / F; point shape and line type tell them apart). Points are nudged sideways slightly so the lines don't hide each other. YPD has no controls; all YPD wells are shown.
 
 ```{r csv_2copy, fig.height=5.5}
 csv_files <- list.files("CSV_files", pattern = "\\.csv$", recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
 
 csv_wells <- tibble(path = csv_files) %>%
-  mutate(Passage = as.integer(str_match(path, "pass(\\d+)/")[, 2]),
+  mutate(SD_only = str_detect(path, "SDpass\\d+/"),
+         Passage = as.integer(str_match(path, "pass(\\d+)/")[, 2]) + ifelse(SD_only, SD_PASSAGE_OFFSET, 0L),
          data = map(path, ~ read.csv(.x, check.names = FALSE, fileEncoding = "UTF-8-BOM") %>%
                       select(id = 1, value = all_of("SSC_S_2copy % Parent")))) %>%
   unnest(data) %>%
@@ -651,7 +663,7 @@ csv_wells <- tibble(path = csv_files) %>%
   mutate(Well = str_match(id, "-([A-H]\\d{1,2}) Well_")[, 2],
          Row = str_sub(Well, 1, 1),
          Col = as.integer(str_extract(Well, "\\d+")),
-         Layout = passage_layout(Passage)) %>%
+         Layout = passage_layout(Passage, SD_only)) %>%
   left_join(plate_layouts, by = c("Layout", "Row", "Col")) %>%
   mutate(Role = assign_role(Media, Row, Col),
          Replicate = assign_replicate(Role, Row, Col),
